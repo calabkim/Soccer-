@@ -1,0 +1,83 @@
+library(dplyr)
+library(caret)
+library(xgboost)
+
+games <- read.csv('games.csv')
+players <- read.csv('players.csv')
+test <- read.csv('test.csv')
+
+head(games)
+head(players)
+head(test)
+
+players_summary <- players %>%
+  group_by(player_id) %>%
+  summarise(
+    avg_rating = mean(overall_rating, na.rm = TRUE),
+    avg_potential = mean(potential, na.rm = TRUE),
+    avg_work_rate = mean(attacking_work_rate == "High") - mean(defensive_work_rate == "Low")
+  )
+
+games <- games %>%
+  left_join(players_summary, by = c('home_player_1' = 'player_id')) %>%
+  left_join(players_summary, by = c('away_player_1' = 'player_id'), suffix = c("_home", "_away"))
+
+games <- games %>%
+  mutate(goal_diff = home_team_goal - away_team_goal,    # Calculate goal difference
+         home_win = ifelse(home_team_goal > away_team_goal, 1, 0))  # Binary outcome: home win or loss
+
+X_class <- games %>%
+  select(avg_rating_home, avg_rating_away, avg_potential_home, avg_potential_away)  # Select features
+y_class <- games$home_win
+
+trainIndex <- createDataPartition(y_class, p = .8, list = FALSE, times = 1)
+X_train_class <- X_class[trainIndex,]
+y_train_class <- y_class[trainIndex]
+X_test_class <- X_class[-trainIndex,]
+y_test_class <- y_class[-trainIndex]
+
+dtrain_class <- xgb.DMatrix(as.matrix(X_train_class), label = y_train_class)
+dtest_class <- xgb.DMatrix(as.matrix(X_test_class), label = y_test_class)
+
+params <- list(objective = "binary:logistic", eval_metric = "auc")
+xgb_class <- xgb.train(params, dtrain_class, nrounds = 100, watchlist = list(test = dtest_class))
+
+pred_class <- predict(xgb_class, dtest_class)
+
+X_reg <- games %>%
+  select(avg_rating_home, avg_rating_away, avg_potential_home, avg_potential_away)  # Select features
+y_reg <- games$goal_diff
+
+X_train_reg <- X_reg[trainIndex,]
+y_train_reg <- y_reg[trainIndex]
+X_test_reg <- X_reg[-trainIndex,]
+y_test_reg <- y_reg[-trainIndex]
+
+dtrain_reg <- xgb.DMatrix(as.matrix(X_train_reg), label = y_train_reg)
+dtest_reg <- xgb.DMatrix(as.matrix(X_test_reg), label = y_test_reg)
+
+params_reg <- list(objective = "reg:squarederror", eval_metric = "rmse")
+xgb_reg <- xgb.train(params_reg, dtrain_reg, nrounds = 100, watchlist = list(test = dtest_reg))
+
+pred_reg <- predict(xgb_reg, dtest_reg)
+
+test_features <- test %>%
+  left_join(players_summary, by = c('home_player_1' = 'player_id')) %>%
+  left_join(players_summary, by = c('away_player_1' = 'player_id'), suffix = c("_home", "_away"))
+
+X_test_final_class <- test_features %>%
+  select(avg_rating_home, avg_rating_away, avg_potential_home, avg_potential_away)
+
+X_test_final_reg <- test_features %>%
+  select(avg_rating_home, avg_rating_away, avg_potential_home, avg_potential_away)
+
+dtest_final_class <- xgb.DMatrix(as.matrix(X_test_final_class))
+pred_test_class <- predict(xgb_class, dtest_final_class)
+test$winner <- ifelse(pred_test_class > 0.5, 1, 0)
+
+dtest_final_reg <- xgb.DMatrix(as.matrix(X_test_final_reg))
+pred_test_reg <- predict(xgb_reg, dtest_final_reg)
+test$winby <- pred_test_reg
+
+write.csv(test %>% select(winner, winby), "submission.csv", row.names = FALSE)
+
