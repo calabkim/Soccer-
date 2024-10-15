@@ -1,83 +1,90 @@
+# Load necessary libraries
 library(dplyr)
+library(randomForest)
 library(caret)
-library(xgboost)
 
-games <- read.csv('games.csv')
-players <- read.csv('players.csv')
-test <- read.csv('test.csv')
+# 1. Load the datasets (assuming they are in the current working directory)
+games <- read.csv("games.csv")
+players <- read.csv("players.csv")
+test_data <- read.csv("test.csv")
 
+# 2. Inspect the first few rows to ensure the data is loaded correctly
 head(games)
 head(players)
-head(test)
+head(test_data)
 
+# 3. Verify column names in the 'players' dataset
+colnames(players)
+
+# 4. Aggregate player statistics (e.g., overall_rating, potential) for home and away players
+# Check if the column 'player_id' exists or needs adjustment
 players_summary <- players %>%
   group_by(player_id) %>%
   summarise(
-    avg_rating = mean(overall_rating, na.rm = TRUE),
-    avg_potential = mean(potential, na.rm = TRUE),
-    avg_work_rate = mean(attacking_work_rate == "High") - mean(defensive_work_rate == "Low")
+    overall_rating = mean(overall_rating, na.rm = TRUE),
+    potential = mean(potential, na.rm = TRUE),
+    crossing = mean(crossing, na.rm = TRUE)
   )
 
+# 5. Merge the aggregated player statistics with the games dataset
+# Join statistics for home and away teams (repeat for all 11 players if needed)
 games <- games %>%
-  left_join(players_summary, by = c('home_player_1' = 'player_id')) %>%
-  left_join(players_summary, by = c('away_player_1' = 'player_id'), suffix = c("_home", "_away"))
+  left_join(players_summary, by = c("home_player_1" = "player_id")) %>%
+  rename(home_player_1_rating = overall_rating)
 
+# Repeat for all players (home_player_2, home_player_3, ..., away_player_1, etc.)
+# This example only shows for home_player_1, repeat this process for other players.
+
+# 6. Create additional features such as average team ratings and home advantage
 games <- games %>%
-  mutate(goal_diff = home_team_goal - away_team_goal,    # Calculate goal difference
-         home_win = ifelse(home_team_goal > away_team_goal, 1, 0))  # Binary outcome: home win or loss
+  mutate(
+    avg_home_rating = rowMeans(select(., starts_with("home_player")), na.rm = TRUE),
+    avg_away_rating = rowMeans(select(., starts_with("away_player")), na.rm = TRUE),
+    home_advantage = 1  # Assuming the home team has an advantage
+  )
 
-X_class <- games %>%
-  select(avg_rating_home, avg_rating_away, avg_potential_home, avg_potential_away)  # Select features
-y_class <- games$home_win
+# 7. Prepare training data: Define the outcome (winner) and relevant features for prediction
+train_data <- games %>%
+  select(avg_home_rating, avg_away_rating, home_advantage, home_team_goal, away_team_goal)
 
-trainIndex <- createDataPartition(y_class, p = .8, list = FALSE, times = 1)
-X_train_class <- X_class[trainIndex,]
-y_train_class <- y_class[trainIndex]
-X_test_class <- X_class[-trainIndex,]
-y_test_class <- y_class[-trainIndex]
+train_data$winner <- ifelse(train_data$home_team_goal > train_data$away_team_goal, 1, 0)  # Home team wins
 
-dtrain_class <- xgb.DMatrix(as.matrix(X_train_class), label = y_train_class)
-dtest_class <- xgb.DMatrix(as.matrix(X_test_class), label = y_test_class)
+# 8. Train a Random Forest model to predict the winner
+winner_model <- randomForest(winner ~ avg_home_rating + avg_away_rating + home_advantage,
+                             data = train_data, importance = TRUE)
 
-params <- list(objective = "binary:logistic", eval_metric = "auc")
-xgb_class <- xgb.train(params, dtrain_class, nrounds = 100, watchlist = list(test = dtest_class))
+# Print the model to check performance
+print(winner_model)
 
-pred_class <- predict(xgb_class, dtest_class)
+# 9. Train a Linear Regression model to predict the win-by margin
+train_data$win_by <- abs(train_data$home_team_goal - train_data$away_team_goal)  # Win-by margin
 
-X_reg <- games %>%
-  select(avg_rating_home, avg_rating_away, avg_potential_home, avg_potential_away)  # Select features
-y_reg <- games$goal_diff
+winby_model <- lm(win_by ~ avg_home_rating + avg_away_rating + home_advantage, data = train_data)
 
-X_train_reg <- X_reg[trainIndex,]
-y_train_reg <- y_reg[trainIndex]
-X_test_reg <- X_reg[-trainIndex,]
-y_test_reg <- y_reg[-trainIndex]
+# Check regression model performance
+summary(winby_model)
 
-dtrain_reg <- xgb.DMatrix(as.matrix(X_train_reg), label = y_train_reg)
-dtest_reg <- xgb.DMatrix(as.matrix(X_test_reg), label = y_test_reg)
+# 10. Preprocess the test data similarly to training data
+test_data <- test_data %>%
+  left_join(players_summary, by = c("home_player_1" = "player_id")) %>%
+  rename(home_player_1_rating = overall_rating) %>%
+  mutate(
+    avg_home_rating = rowMeans(select(., starts_with("home_player")), na.rm = TRUE),
+    avg_away_rating = rowMeans(select(., starts_with("away_player")), na.rm = TRUE),
+    home_advantage = 1  # Assuming home advantage
+  )
 
-params_reg <- list(objective = "reg:squarederror", eval_metric = "rmse")
-xgb_reg <- xgb.train(params_reg, dtrain_reg, nrounds = 100, watchlist = list(test = dtest_reg))
+# 11. Make predictions on the test data
+test_data$predicted_winner <- predict(winner_model, test_data)
+test_data$predicted_win_by <- predict(winby_model, test_data)
 
-pred_reg <- predict(xgb_reg, dtest_reg)
+# 12. Prepare the submission file (predicted winner and win-by)
+submission <- test_data %>%
+  select(predicted_winner, predicted_win_by) %>%
+  rename(winner = predicted_winner, winby = predicted_win_by)
 
-test_features <- test %>%
-  left_join(players_summary, by = c('home_player_1' = 'player_id')) %>%
-  left_join(players_summary, by = c('away_player_1' = 'player_id'), suffix = c("_home", "_away"))
+# 13. Write the submission file
+write.csv(submission, "submission.csv", row.names = FALSE)
 
-X_test_final_class <- test_features %>%
-  select(avg_rating_home, avg_rating_away, avg_potential_home, avg_potential_away)
-
-X_test_final_reg <- test_features %>%
-  select(avg_rating_home, avg_rating_away, avg_potential_home, avg_potential_away)
-
-dtest_final_class <- xgb.DMatrix(as.matrix(X_test_final_class))
-pred_test_class <- predict(xgb_class, dtest_final_class)
-test$winner <- ifelse(pred_test_class > 0.5, 1, 0)
-
-dtest_final_reg <- xgb.DMatrix(as.matrix(X_test_final_reg))
-pred_test_reg <- predict(xgb_reg, dtest_final_reg)
-test$winby <- pred_test_reg
-
-write.csv(test %>% select(winner, winby), "submission.csv", row.names = FALSE)
+# Output is saved as submission.csv, which contains predictions for the test set
 
