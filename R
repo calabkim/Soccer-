@@ -2,81 +2,125 @@
 library(dplyr)
 library(randomForest)
 library(caret)
+library(xgboost)
 
-# 1. Load the datasets (assuming they are in the current working directory)
+# 1. Load the datasets
 games <- read.csv("games.csv")
 players <- read.csv("players.csv")
 test_data <- read.csv("test.csv")
 
-# 2. Inspect the first few rows to ensure the data is loaded correctly
-head(games)
-head(players)
-head(test_data)
-
-# 3. Verify column names in the 'players' dataset
-colnames(players)
-
-# 4. Aggregate player statistics (e.g., overall_rating, potential) for home and away players
-# Check if the column 'player_id' exists or needs adjustment
+# 2. Aggregate player statistics
 players_summary <- players %>%
   group_by(player_id) %>%
   summarise(
-    overall_rating = mean(overall_rating, na.rm = TRUE),
-    potential = mean(potential, na.rm = TRUE),
-    crossing = mean(crossing, na.rm = TRUE)
+    overall_rating = mean(overall_rating, na.rm = TRUE)
   )
 
-# 5. Merge the aggregated player statistics with the games dataset
-# Join statistics for home and away teams (repeat for all 11 players if needed)
-games <- games %>%
-  left_join(players_summary, by = c("home_player_1" = "player_id")) %>%
-  rename(home_player_1_rating = overall_rating)
+# 3. Merge the aggregated player statistics with the games dataset
+for (i in 1:11) {
+  # Join statistics for home players
+  home_player_col <- paste0("home_player_", i)
+  games <- games %>%
+    left_join(players_summary, by = setNames("player_id", home_player_col)) %>%
+    rename_with(~ paste0("home_player_", i, "_", .), c("overall_rating"))
+  
+  # Join statistics for away players
+  away_player_col <- paste0("away_player_", i)
+  games <- games %>%
+    left_join(players_summary, by = setNames("player_id", away_player_col)) %>%
+    rename_with(~ paste0("away_player_", i, "_", .), c("overall_rating"))
+}
 
-# Repeat for all players (home_player_2, home_player_3, ..., away_player_1, etc.)
-# This example only shows for home_player_1, repeat this process for other players.
+# Handle missing team IDs and player IDs
+games[is.na(games)] <- -1
 
-# 6. Create additional features such as average team ratings and home advantage
+# 4. Feature Engineering: Calculate team-level statistics
 games <- games %>%
   mutate(
-    avg_home_rating = rowMeans(select(., starts_with("home_player")), na.rm = TRUE),
-    avg_away_rating = rowMeans(select(., starts_with("away_player")), na.rm = TRUE),
-    home_advantage = 1  # Assuming the home team has an advantage
+    avg_home_rating = rowMeans(select(., contains("home_player_") & contains("_overall_rating")), na.rm = TRUE),
+    avg_away_rating = rowMeans(select(., contains("away_player_") & contains("_overall_rating")), na.rm = TRUE),
+    home_advantage = 1
   )
 
-# 7. Prepare training data: Define the outcome (winner) and relevant features for prediction
+# 5. Prepare training data: Define the outcome (winner) and relevant features for prediction
 train_data <- games %>%
   select(avg_home_rating, avg_away_rating, home_advantage, home_team_goal, away_team_goal)
 
-train_data$winner <- ifelse(train_data$home_team_goal > train_data$away_team_goal, 1, 0)  # Home team wins
+train_data$winner <- ifelse(train_data$home_team_goal > train_data$away_team_goal, 1, 0)
 
-# 8. Train a Random Forest model to predict the winner
-winner_model <- randomForest(winner ~ avg_home_rating + avg_away_rating + home_advantage,
-                             data = train_data, importance = TRUE)
+# 6. Split data into training and validation sets
+set.seed(123)
+trainIndex <- createDataPartition(train_data$winner, p = 0.8, list = FALSE)
+training_set <- train_data[trainIndex, ]
+validation_set <- train_data[-trainIndex, ]
 
-# Print the model to check performance
-print(winner_model)
+# 7. Train a Gradient Boosting Model to predict the winner
+train_matrix <- xgb.DMatrix(data = as.matrix(training_set %>% select(avg_home_rating, avg_away_rating, home_advantage)), label = training_set$winner)
+validation_matrix <- xgb.DMatrix(data = as.matrix(validation_set %>% select(avg_home_rating, avg_away_rating, home_advantage)), label = validation_set$winner)
+
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "auc"
+)
+
+xgb_model <- xgb.train(
+  params = params,
+  data = train_matrix,
+  nrounds = 500,
+  watchlist = list(val = validation_matrix),
+  early_stopping_rounds = 20,
+  verbose = 1
+)
+
+# 8. Predict on validation data and evaluate performance
+validation_preds <- predict(xgb_model, validation_matrix)
+validation_preds_binary <- ifelse(validation_preds > 0.5, 1, 0)
+confusionMatrix(as.factor(validation_preds_binary), as.factor(validation_set$winner))
 
 # 9. Train a Linear Regression model to predict the win-by margin
-train_data$win_by <- abs(train_data$home_team_goal - train_data$away_team_goal)  # Win-by margin
+training_set <- training_set %>% filter(!is.na(avg_home_rating) & !is.na(avg_away_rating) & !is.na(home_team_goal) & !is.na(away_team_goal))
+training_set$win_by <- abs(training_set$home_team_goal - training_set$away_team_goal)
 
-winby_model <- lm(win_by ~ avg_home_rating + avg_away_rating + home_advantage, data = train_data)
-
-# Check regression model performance
+# Simplify the model by using fewer predictors to avoid multicollinearity
+winby_model <- lm(win_by ~ avg_home_rating + avg_away_rating, data = training_set)
 summary(winby_model)
 
 # 10. Preprocess the test data similarly to training data
+for (i in 1:11) {
+  home_player_col <- paste0("home_player_", i)
+  away_player_col <- paste0("away_player_", i)
+  test_data <- test_data %>%
+    left_join(players_summary, by = setNames("player_id", home_player_col)) %>%
+    rename_with(~ paste0("home_player_", i, "_", .), c("overall_rating")) %>%
+    left_join(players_summary, by = setNames("player_id", away_player_col)) %>%
+    rename_with(~ paste0("away_player_", i, "_", .), c("overall_rating"))
+}
+
+# Handle missing team IDs and player IDs in the test set
+test_data[is.na(test_data)] <- -1
+
+# Ensure all required features are present in test data
 test_data <- test_data %>%
-  left_join(players_summary, by = c("home_player_1" = "player_id")) %>%
-  rename(home_player_1_rating = overall_rating) %>%
   mutate(
-    avg_home_rating = rowMeans(select(., starts_with("home_player")), na.rm = TRUE),
-    avg_away_rating = rowMeans(select(., starts_with("away_player")), na.rm = TRUE),
-    home_advantage = 1  # Assuming home advantage
+    avg_home_rating = rowMeans(select(., contains("home_player_") & contains("_overall_rating")), na.rm = TRUE),
+    avg_away_rating = rowMeans(select(., contains("away_player_") & contains("_overall_rating")), na.rm = TRUE),
+    home_advantage = 1
   )
 
+# Align column names with training data
+test_data <- test_data %>% select(avg_home_rating, avg_away_rating, home_advantage)
+
 # 11. Make predictions on the test data
-test_data$predicted_winner <- predict(winner_model, test_data)
-test_data$predicted_win_by <- predict(winby_model, test_data)
+# Ensure the features in test data match those used in the training
+test_matrix <- xgb.DMatrix(data = as.matrix(test_data %>% select(avg_home_rating, avg_away_rating, home_advantage)))
+test_data$predicted_winner <- predict(xgb_model, test_matrix)
+
+if (exists("winby_model")) {
+  test_data$predicted_win_by <- predict(winby_model, newdata = test_data)
+} else {
+  test_data$predicted_win_by <- NA
+}
 
 # 12. Prepare the submission file (predicted winner and win-by)
 submission <- test_data %>%
@@ -85,6 +129,3 @@ submission <- test_data %>%
 
 # 13. Write the submission file
 write.csv(submission, "submission.csv", row.names = FALSE)
-
-# Output is saved as submission.csv, which contains predictions for the test set
-
